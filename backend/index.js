@@ -1,823 +1,456 @@
 const express = require('express');
-const moment = require('moment');
+const cors = require('cors');
 const axios = require('axios');
-const cron = require('node-cron');
-const path = require('path');
 const cheerio = require('cheerio');
-
-// 한국 시간 설정
-moment.locale('ko');
+const moment = require('moment');
+const cron = require('node-cron');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-// 미들웨어 설정
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
-
 // CORS 설정
-app.use((req, res, next) => {
-  res.header('Access-Control-Allow-Origin', '*');
-  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
-  
-  // OPTIONS 요청 처리
-  if (req.method === 'OPTIONS') {
-    return res.status(200).end();
+app.use(cors({
+  origin: ['http://localhost:3000', 'http://localhost:3001'],
+  credentials: true
+}));
+
+app.use(express.json());
+
+// 글로벌 데이터 저장소
+let newsData = {};
+let lastUpdateTime = '';
+
+// 📺 YouTube RSS 병렬 뉴스 수집 시스템 (5개 검증된 채널)
+const VERIFIED_CHANNELS = [
+  { id: 'UCkinYTS9IHqOEwR1Sze2JTw', name: 'SBS뉴스', lang: 'ko' },  // ✅ SBS 뉴스
+  { id: 'UCcQTRi69dsVYHN3exePtZ1A', name: 'KBS뉴스', lang: 'ko' },  // ✅ KBS 뉴스  
+  { id: 'UChlgI3UHCOnwUGzWzbJ3H5w', name: 'YTN', lang: 'ko' },      // ✅ YTN
+  { id: 'UC16niRr50-MSBwiO3YDb3RA', name: 'BBC뉴스', lang: 'en' },  // ✅ BBC News
+  { id: 'UCupvZG-5ko_eiXAupbDfxWw', name: 'CNN', lang: 'en' }       // ✅ CNN
+];
+
+// 카테고리별 키워드 매핑
+const KEYWORDS = {
+  economy: {
+    ko: [
+      // 거시경제
+      '경제', 'GDP', '성장률', '경기', '경기침체', '경기회복', '경기전망',
+      // 금융/통화
+      '금리', '인플레이션', '물가', '디플레이션', '통화정책', '한은', '기준금리',
+      // 산업/기업
+      '산업', '기업', '대기업', '중소기업', '벤처', '스타트업', '신산업',
+      // 무역/수출입
+      '수출', '수입', '무역', '무역수지', '무역적자', '무역흑자', 'FTA',
+      // 고용/노동
+      '고용', '실업', '취업', '일자리', '노동시장', '최저임금', '노사',
+      // 부동산
+      '부동산', '아파트', '주택', '전세', '월세', '부동산시장', '재건축', '재개발'
+    ],
+    en: [
+      'economy', 'GDP', 'growth', 'recession', 'recovery', 'outlook',
+      'interest', 'inflation', 'deflation', 'monetary', 'policy',
+      'industry', 'company', 'enterprise', 'venture', 'startup',
+      'export', 'import', 'trade', 'balance', 'FTA',
+      'employment', 'unemployment', 'job', 'labor', 'minimum wage',
+      'real estate', 'apartment', 'housing', 'rent', 'development'
+    ]
+  },
+  usStock: {
+    ko: [
+      // 주요 지수
+      '다우존스', 'S&P500', '나스닥', '월스트리트', '뉴욕증시', '미국증시',
+      // 주요 기업
+      '애플', '마이크로소프트', '구글', '아마존', '테슬라', '메타', '넷플릭스',
+      // 시장 동향
+      '주가', '주식시장', '증시', '장중', '장외', '상승', '하락', '보합',
+      // 투자/분석
+      '투자', '매수', '매도', '포트폴리오', '펀드', 'ETF', '주식투자',
+      // 경제지표
+      '실적', '분기실적', '연간실적', '실적발표', '실적전망', 'PER', 'PBR'
+    ],
+    en: [
+      'dow', 'jones', 'S&P', 'nasdaq', 'wall street', 'NYSE',
+      'apple', 'microsoft', 'google', 'amazon', 'tesla', 'meta', 'netflix',
+      'stock', 'market', 'trading', 'bull', 'bear',
+      'investment', 'portfolio', 'fund', 'ETF',
+      'earnings', 'quarterly', 'annual', 'forecast', 'PER', 'PBR'
+    ]
+  },
+  exchangeRate: {
+    ko: [
+      // 주요 통화
+      '환율', '달러', '원화', '엔화', '유로', '위안', '파운드',
+      // 환율 관련
+      '원-달러', '원-엔', '원-유로', '달러-엔', '달러-유로', '크로스레이트',
+      // 시장 동향
+      '외환시장', '환전', '환차익', '환차손', '환헤지', '환리스크',
+      // 정책/기관
+      '한은', '외환정책', '외환보유액', '외환시장개입', '스왑라인',
+      // 경제지표
+      '무역수지', '경상수지', '자본수지', '국제수지', '외채', '외환보유액'
+    ],
+    en: [
+      'exchange', 'rate', 'dollar', 'won', 'yen', 'euro', 'yuan', 'pound',
+      'forex', 'FX', 'cross rate',
+      'currency', 'market', 'hedge', 'risk',
+      'central bank', 'reserves', 'intervention', 'swap',
+      'balance', 'current account', 'capital account', 'debt'
+    ]
+  },
+  sports: {
+    ko: [
+      // 구기종목
+      '축구', '야구', '농구', '배구', '골프', '테니스',
+      // 국내 리그
+      'K리그', 'KBO', 'KBL', 'V리그', 'KPGA', 'KLPGA',
+      // 국제 대회
+      '월드컵', '올림픽', '아시안게임', '챔피언스리그', '월드시리즈',
+      // 선수/팀
+      '선수', '팀', '감독', '코치', '스타', '유망주', '신인',
+      // 경기/대회
+      '경기', '대회', '리그', '토너먼트', '예선', '본선', '결승'
+    ],
+    en: [
+      'football', 'soccer', 'baseball', 'basketball', 'volleyball', 'golf', 'tennis',
+      'K-league', 'KBO', 'KBL', 'V-league', 'KPGA', 'KLPGA',
+      'world cup', 'olympics', 'asian games', 'champions league', 'world series',
+      'player', 'team', 'coach', 'star', 'rookie',
+      'game', 'tournament', 'league', 'qualification', 'final'
+    ]
   }
-  
-  next();
-});
-
-// 정적 파일 서빙 (프론트엔드 빌드 파일)
-// 실제 배포 시 사용할 코드
-// app.use(express.static(path.join(__dirname, '../frontend/build')));
-
-// 뉴스 카테고리 정의
-const categories = ['경제', '스포츠', '미국주식', '환율'];
-
-// 뉴스 데이터를 저장할 객체
-let newsData = {
-  경제: [],
-  스포츠: [],
-  미국주식: [],
-  환율: []
 };
 
-// 기본 라우트
-app.get('/', (req, res) => {
-  res.json({
-    message: '한국 경제 뉴스 자동 수집 시스템 API',
-    serverTime: moment().format('YYYY년 MM월 DD일 HH:mm:ss'),
-    timezone: 'KST (UTC+9)',
-    lastUpdate: lastUpdateTime,
-    categories: categories
-  });
-});
-
-// 마지막 업데이트 시간 추적
-let lastUpdateTime = moment().format('YYYY년 MM월 DD일 HH:mm:ss');
-
-// 모든 뉴스 가져오기 API
-app.get('/api/news', (req, res) => {
-  res.json({
-    timestamp: moment().format('YYYY년 MM월 DD일 HH:mm:ss'),
-    lastUpdate: lastUpdateTime,
-    categories: categories,
-    news: newsData
-  });
-});
-
-// 카테고리별 뉴스 가져오기 API
-app.get('/api/news/:category', (req, res) => {
-  const category = req.params.category;
-  
-  if (!newsData[category]) {
-    return res.status(404).json({ error: '카테고리를 찾을 수 없습니다.' });
+// 카테고리별 제외 키워드
+const EXCLUDE_KEYWORDS = {
+  economy: {
+    ko: [...KEYWORDS.exchangeRate.ko, ...KEYWORDS.usStock.ko],
+    en: [...KEYWORDS.exchangeRate.en, ...KEYWORDS.usStock.en]
+  },
+  usStock: {
+    ko: [...KEYWORDS.exchangeRate.ko],
+    en: [...KEYWORDS.exchangeRate.en]
+  },
+  exchangeRate: {
+    ko: [...KEYWORDS.usStock.ko],
+    en: [...KEYWORDS.usStock.en]
   }
-  
-  res.json({
-    timestamp: moment().format('YYYY년 MM월 DD일 HH:mm:ss'),
-    lastUpdate: lastUpdateTime,
-    category: category,
-    count: newsData[category].length,
-    news: newsData[category]
-  });
-});
+};
 
-// 뉴스 수집 함수 - 실제 구현에서는 외부 API나 웹 스크래핑을 사용할 것
-const collectEconomicNews = async () => {
-  try {
-    console.log('경제 뉴스 수집 중...');
+// 🎯 모든 뉴스 카테고리를 병렬로 수집
+const collectAllNews = async () => {
+  const startTime = Date.now();
+  console.log(`\n🚀 [${moment().format('YYYY-MM-DD HH:mm:ss')}] 뉴스 수집 작업 시작...`);
+  
+  // 예상 완료 시간 계산 (최대 5초)
+  const expectedDuration = 5; // 초
+  const expectedEndTime = moment().add(expectedDuration, 'seconds');
+  console.log(`⏳ 예상 완료 시간: ${expectedEndTime.format('HH:mm:ss')} (최대 ${expectedDuration}초)`);
+  
+  // 카테고리별로 뉴스 분류 (비동기 for...of 루프 사용)
+  for (const [category, keywords] of Object.entries(KEYWORDS)) {
+    console.log(`\n📺 ${category} 뉴스 수집 중...`);
+    let filled = false;
+    let attempt = 0;
+    let lastError = null;
+    let failureReasons = new Set();
     
-    // 한국경제 웹사이트에서 직접 경제 뉴스 스크래핑
-    const response = await axios.get('https://www.hankyung.com/economy', {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-      }
-    });
-    
-    const $ = cheerio.load(response.data);
-    const articles = [];
-    
-    // 메인 뉴스
-    $('.news-list .news-item').each((index, element) => {
-      if (articles.length < 9) {
-        const titleEl = $(element).find('.news-tit');
-        const title = titleEl.text().trim();
-        const link = $(element).find('a').attr('href');
-        const date = $(element).find('.time').text().trim() || moment().format('YYYY-MM-DD HH:mm');
-        
-        if (title && link) {
-          articles.push({
-            title,
-            source: '한국경제',
-            date,
-            content: `${title} - 자세한 내용은 원문을 참조하세요.`,
-            link,
-            imageUrl: $(element).find('img').attr('src') || 'https://images.unsplash.com/photo-1590283603385-17ffb3a7f29f?q=80&w=2070'
+    // 다양한 설정 조합
+    const settings = [
+      { timeout: 10000, headers: { 'User-Agent': 'Mozilla/5.0' } },
+      { timeout: 20000, headers: { 'User-Agent': 'Mozilla/5.0', 'Accept-Language': 'en-US,en;q=0.9' } },
+      { timeout: 15000, headers: { 'User-Agent': 'Googlebot/2.1 (+http://www.google.com/bot.html)' } },
+      { timeout: 12000, headers: { 'User-Agent': 'Mozilla/5.0', 'Cache-Control': 'no-cache' } },
+      { timeout: 8000, headers: { 'User-Agent': 'Mozilla/5.0', 'Pragma': 'no-cache' } },
+      { timeout: 25000, headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'application/xml' } },
+      { timeout: 18000, headers: { 'User-Agent': 'Mozilla/5.0', 'Accept-Encoding': 'gzip, deflate' } }
+    ];
+
+    while (!filled) {
+      attempt++;
+      const setting = settings[attempt % settings.length];
+      console.log(`\n🔄 ${category} 뉴스 수집 시도 #${attempt}`);
+      console.log(`⚙️ 현재 설정: timeout=${setting.timeout}ms, headers=${JSON.stringify(setting.headers)}`);
+      
+      let articles = [];
+      let channelErrors = new Map();
+      
+      try {
+        // 채널별로 RSS 수집 (설정 변경 적용)
+        await Promise.all(VERIFIED_CHANNELS.map(async (channel) => {
+          const rssUrl = `https://www.youtube.com/feeds/videos.xml?channel_id=${channel.id}`;
+          try {
+            const response = await axios.get(rssUrl, {
+              timeout: setting.timeout,
+              headers: setting.headers
+            });
+            
+            // 응답 데이터 검증
+            if (!response.data) {
+              throw new Error('응답 데이터 없음');
+            }
+            
+            const $ = cheerio.load(response.data, { xmlMode: true });
+            const entries = $('entry');
+            
+            if (entries.length === 0) {
+              throw new Error('RSS 엔트리 없음');
+            }
+            
+            entries.each((index, element) => {
+              if (articles.length < 20) {
+                const title = $(element).find('title').text().trim();
+                const videoId = $(element).find('yt\\:videoId, videoId').text().trim();
+                const published = $(element).find('published').text().trim();
+                
+                // 데이터 유효성 검증
+                if (!title || !videoId) {
+                  console.log(`⚠️ ${channel.name}: 제목 또는 비디오 ID 누락`);
+                  return;
+                }
+                
+                // 더미/로딩/안내성 뉴스 필터링
+                if (title.includes('로딩') || title.includes('안내') || title.includes('더미')) {
+                  console.log(`⚠️ ${channel.name}: 더미/로딩/안내성 뉴스 제외`);
+                  return;
+                }
+                
+                const publishedDate = published ? moment(published).format('YYYY-MM-DD HH:mm') : moment().format('YYYY-MM-DD HH:mm');
+                articles.push({
+                  id: `youtube_${channel.name}_${videoId}`,
+                  title: title,
+                  source: channel.name,
+                  date: publishedDate,
+                  content: `${title} - ${channel.name}에서 제공하는 뉴스입니다.`,
+                  imageUrl: `https://img.youtube.com/vi/${videoId}/maxresdefault.jpg`,
+                  link: `https://www.youtube.com/watch?v=${videoId}`
+                });
+              }
+            });
+          } catch (err) {
+            const errorType = err.code === 'ECONNABORTED' ? '타임아웃' :
+                            err.response ? `HTTP ${err.response.status}` :
+                            err.message.includes('parse') ? '파싱 오류' : '알 수 없는 오류';
+            channelErrors.set(channel.name, { type: errorType, message: err.message });
+            console.log(`❌ ${channel.name} 수집 실패: ${errorType} - ${err.message}`);
+          }
+        }));
+
+        // 실패 원인 분석 및 로깅
+        if (channelErrors.size > 0) {
+          console.log('\n📊 실패 원인 분석:');
+          channelErrors.forEach((error, channel) => {
+            console.log(`- ${channel}: ${error.type} - ${error.message}`);
+            failureReasons.add(error.type);
           });
         }
-      }
-    });
-    
-    // 뉴스가 부족하면 다른 사이트에서도 가져오기
-    if (articles.length < 9) {
-      try {
-        // 매일경제 뉴스도 추가로 가져오기
-        const maekyungResponse = await axios.get('https://www.mk.co.kr/economy/', {
-          headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-          }
-        });
-        
-        const mk$ = cheerio.load(maekyungResponse.data);
-        
-        mk$('.list_area li').each((index, element) => {
-          if (articles.length < 9) {
-            const titleEl = mk$(element).find('.news_ttl');
-            const title = titleEl.text().trim();
-            let link = titleEl.find('a').attr('href');
-            
-            // 상대 경로를 절대 경로로 변환
-            if (link && !link.startsWith('http')) {
-              link = link.startsWith('/') ? 'https://www.mk.co.kr' + link : 'https://www.mk.co.kr/' + link;
-            }
-            
-            const date = mk$(element).find('.time').text().trim() || moment().format('YYYY-MM-DD HH:mm');
-            
-            if (title && link) {
-              articles.push({
-                title,
-                source: '매일경제',
-                date,
-                content: `${title} - 자세한 내용은 원문을 참조하세요.`,
-                link,
-                imageUrl: mk$(element).find('img').attr('src') || 'https://images.unsplash.com/photo-1444653614773-995cb1ef9efa?q=80&w=2076'
-              });
-            }
-          }
-        });
-      } catch (mkError) {
-        console.error('매일경제 뉴스 스크래핑 중 오류 발생:', mkError.message);
-      }
-    }
-    
-    // 데이터가 없으면 네이버 경제 뉴스에서 가져오기
-    if (articles.length < 9) {
-      try {
-        const naverResponse = await axios.get('https://news.naver.com/main/main.naver?mode=LSD&mid=shm&sid1=101', {
-          headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-          }
-        });
-        
-        const naver$ = cheerio.load(naverResponse.data);
-        
-        naver$('.sh_item').each((index, element) => {
-          if (articles.length < 9) {
-            const titleEl = naver$(element).find('.sh_text_headline');
-            const title = titleEl.text().trim();
-            let link = titleEl.attr('href');
-            
-            if (title && link) {
-              articles.push({
-                title,
-                source: '네이버 뉴스',
-                date: moment().format('YYYY-MM-DD HH:mm'),
-                content: `${title} - 자세한 내용은 원문을 참조하세요.`,
-                link,
-                imageUrl: naver$(element).find('img').attr('src') || 'https://images.unsplash.com/photo-1638913662415-8c5f79b20656?q=80&w=2070'
-              });
-            }
-          }
-        });
-      } catch (naverError) {
-        console.error('네이버 뉴스 스크래핑 중 오류 발생:', naverError.message);
-      }
-    }
-    
-    // 가져온 뉴스가 있으면 사용, 없으면 기본 데이터 사용
-    if (articles.length > 0) {
-      newsData['경제'] = articles;
-      console.log(`경제 뉴스 ${articles.length}개 수집 완료 (실제 뉴스)`);
-    } else {
-      // 기본 데이터
-      const fallbackData = [{
-        title: `오늘의 경제 동향: ${moment().format('MM월 DD일')} 기준`,
-        source: '경제신문',
-        date: moment().format('YYYY-MM-DD HH:mm'),
-        content: `오늘의 경제 동향을 분석합니다. ${moment().format('YYYY년 MM월 DD일')}의 주요 이슈는 물가와 금리 정책입니다. 현재 원/달러 환율은 약 1350원 수준입니다.`,
-        imageUrl: 'https://images.unsplash.com/photo-1590283603385-17ffb3a7f29f?q=80&w=2070',
-        link: 'https://www.hankyung.com/economy'
-      }];
-      
-      newsData['경제'] = fallbackData;
-      console.log(`경제 뉴스 ${fallbackData.length}개 수집 완료 (기본 데이터)`);
-    }
-    
-  } catch (error) {
-    console.error('경제 뉴스 수집 중 오류 발생:', error.message);
-    
-    // 오류 발생 시 기본 데이터 사용
-    const fallbackData = [{
-      title: `오늘의 경제 뉴스: ${moment().format('MM월 DD일')}`,
-      source: '경제신문',
-      date: moment().format('YYYY-MM-DD HH:mm'),
-      content: `오늘의 주요 경제 뉴스입니다. 실시간 환율 정보와 주요 이슈를 확인하세요.`,
-      imageUrl: 'https://images.unsplash.com/photo-1590283603385-17ffb3a7f29f?q=80&w=2070',
-      link: 'https://www.hankyung.com/economy'
-    }];
-    
-    newsData['경제'] = fallbackData;
-    console.log(`경제 뉴스 ${fallbackData.length}개 수집 완료 (오류 대체 데이터)`);
-  }
-};
 
-const collectSportsNews = async () => {
-  try {
-    console.log('스포츠 뉴스 수집 중...');
-    
-    // 네이버 스포츠 뉴스에서 직접 스크래핑
-    const sportsArticles = [];
-    
-    // 네이버 스포츠 뉴스 스크래핑
-    try {
-      const response = await axios.get('https://sports.naver.com/', {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-        }
-      });
-      
-      const $ = cheerio.load(response.data);
-      
-      // 주요 뉴스 스크래핑
-      $('.home_news .today_item, .home_news .main_item').each((index, element) => {
-        if (sportsArticles.length < 9) {
-          const titleEl = $(element).find('.title');
-          const title = titleEl.text().trim();
-          let link = $(element).find('a').attr('href');
+        // 키워드 필터 및 중복 제거 로직 수정
+        let categoryArticles = [];
+        const categoryKeywords = KEYWORDS[category] || {};
+        const excludeKeywords = EXCLUDE_KEYWORDS[category] || {};
+
+        articles.forEach(article => {
+          const title = article.title.toLowerCase();
           
-          // 상대 경로를 절대 경로로 변환
-          if (link && !link.startsWith('http')) {
-            link = 'https://sports.naver.com' + link;
+          // 제외 키워드 체크
+          const isExcluded = (excludeKeywords.ko || []).some(keyword => title.includes(keyword.toLowerCase())) ||
+                            (excludeKeywords.en || []).some(keyword => title.includes(keyword.toLowerCase()));
+          
+          if (isExcluded) return;
+          
+          // 포함 키워드 체크
+          const isRelevant = (categoryKeywords.ko || []).some(keyword => title.includes(keyword.toLowerCase())) ||
+                            (categoryKeywords.en || []).some(keyword => title.includes(keyword.toLowerCase()));
+          
+          if (isRelevant) {
+            // 중복 제거
+            if (!categoryArticles.find(a => a.id === article.id || a.title === article.title)) {
+              categoryArticles.push(article);
+            }
           }
-          
-          if (title && link) {
-            sportsArticles.push({
-              title,
-              source: '네이버 스포츠',
-              date: moment().format('YYYY-MM-DD HH:mm'),
-              content: `${title} - 자세한 내용은 원문을 참조하세요.`,
-              link,
-              imageUrl: $(element).find('img').attr('src') || sportsImages[sportsArticles.length % sportsImages.length]
+        });
+        // 최신순 정렬 후 5개만
+        let sortedArticles = categoryArticles
+          .sort((a, b) => moment(b.date).unix() - moment(a.date).unix());
+        // 조건 완화: 5개 미만이면 키워드 일부라도 포함된 뉴스만 추가(연관성 없는 뉴스는 절대 포함하지 않음)
+        if (sortedArticles.length < 5) {
+          const alreadyIds = new Set(sortedArticles.map(a => a.id));
+          const fillArticles = articles
+            .filter(a => {
+              if (alreadyIds.has(a.id)) return false;
+              // 제목에 카테고리 연관 키워드 일부라도 포함된 경우만 허용
+              return (categoryKeywords.ko || []).some(keyword => a.title.toLowerCase().includes(keyword.toLowerCase())) ||
+                     (categoryKeywords.en || []).some(keyword => a.title.toLowerCase().includes(keyword.toLowerCase()));
+            })
+            .sort((a, b) => moment(b.date).unix() - moment(a.date).unix());
+          for (const a of fillArticles) {
+            if (sortedArticles.length >= 5) break;
+            sortedArticles.push(a);
+          }
+        }
+        sortedArticles = sortedArticles.slice(0, 5);
+
+        if (sortedArticles.length === 5) {
+          newsData[category] = sortedArticles;
+          console.log(`\n✅ ${category} 뉴스 5개 수집 성공! (시도 ${attempt})`);
+          console.log('📰 수집된 뉴스:');
+          sortedArticles.forEach((article, index) => {
+            console.log(`${index + 1}. ${article.title} (${article.source})`);
+          });
+          filled = true;
+        } else {
+          console.log(`\n⚠️ ${category} 뉴스 ${sortedArticles.length}개만 수집됨 (목표: 5개)`);
+          if (sortedArticles.length > 0) {
+            console.log('📰 현재까지 수집된 뉴스:');
+            sortedArticles.forEach((article, index) => {
+              console.log(`${index + 1}. ${article.title} (${article.source})`);
             });
           }
+          console.log('🔄 재시도 계속...');
         }
-      });
-    } catch (naverError) {
-      console.error('네이버 스포츠 뉴스 스크래핑 중 오류 발생:', naverError.message);
-    }
-    
-    // 네이버에서 충분한 뉴스를 가져오지 못했다면 스포티비 뉴스에서도 가져오기
-    if (sportsArticles.length < 9) {
-      try {
-        const sportvResponse = await axios.get('https://www.spotvnews.co.kr/news/articleList.html?sc_section_code=S1N1', {
-          headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-          }
-        });
-        
-        const sportv$ = cheerio.load(sportvResponse.data);
-        
-        sportv$('.article-list .list-block').each((index, element) => {
-          if (sportsArticles.length < 9) {
-            const titleEl = sportv$(element).find('.list-titles');
-            const title = titleEl.text().trim();
-            let link = sportv$(element).find('a').attr('href');
-            
-            // 상대 경로를 절대 경로로 변환
-            if (link && !link.startsWith('http')) {
-              link = 'https://www.spotvnews.co.kr' + link;
-            }
-            
-            const date = sportv$(element).find('.list-dated').text().trim() || moment().format('YYYY-MM-DD HH:mm');
-            
-            if (title && link) {
-              sportsArticles.push({
-                title,
-                source: '스포티비뉴스',
-                date,
-                content: `${title} - 자세한 내용은 원문을 참조하세요.`,
-                link,
-                imageUrl: sportv$(element).find('img').attr('src') || sportsImages[sportsArticles.length % sportsImages.length]
-              });
-            }
-          }
-        });
-      } catch (sportvError) {
-        console.error('스포티비 뉴스 스크래핑 중 오류 발생:', sportvError.message);
+      } catch (err) {
+        lastError = err;
+        console.log(`\n❌ ${category} 전체 수집 실패 (시도 ${attempt}):`, err.message);
+        console.log('🔄 재시도 계속...');
       }
     }
-    
-    // 가져온 뉴스가 있으면 사용, 없으면 기본 데이터 사용
-    if (sportsArticles.length > 0) {
-      newsData['스포츠'] = sportsArticles;
-      console.log(`스포츠 뉴스 ${sportsArticles.length}개 수집 완료 (실제 뉴스)`);
-    } else {
-      // 기본 데이터
-      const fallbackData = [{
-        title: `오늘의 스포츠 하이라이트: ${moment().format('MM월 DD일')}`,
-        source: '스포츠신문',
-        date: moment().format('YYYY-MM-DD HH:mm'),
-        content: `오늘의 주요 스포츠 소식입니다. 국내외 스포츠 경기 결과와 선수들의 활약상을 확인하세요.`,
-        imageUrl: 'https://images.unsplash.com/photo-1461896836934-ffe607ba8211?q=80&w=2070',
-        link: 'https://sports.naver.com/'
-      }];
-      
-      newsData['스포츠'] = fallbackData;
-      console.log(`스포츠 뉴스 ${fallbackData.length}개 수집 완료 (기본 데이터)`);
-    }
-    
-  } catch (error) {
-    console.error('스포츠 뉴스 수집 중 오류 발생:', error.message);
-    
-    // 오류 발생 시 기본 데이터 사용
-    const fallbackData = [{
-      title: `오늘의 스포츠 소식: ${moment().format('MM월 DD일')}`,
-      source: '스포츠신문',
-      date: moment().format('YYYY-MM-DD HH:mm'),
-      content: `오늘의 주요 스포츠 경기 결과와 소식을 확인하세요.`,
-      imageUrl: 'https://images.unsplash.com/photo-1461896836934-ffe607ba8211?q=80&w=2070',
-      link: 'https://sports.naver.com/'
-    }];
-    
-    newsData['스포츠'] = fallbackData;
-    console.log(`스포츠 뉴스 ${fallbackData.length}개 수집 완료 (오류 대체 데이터)`);
   }
-};
-
-const collectUSStockNews = async () => {
-  try {
-    console.log('미국주식 뉴스 수집 중...');
-    
-    // 더미 데이터 생성
-    const newNews = [
-      {
-        title: `미국 주식시장: ${moment().format('MM월 DD일')} 마감 동향`,
-        source: '월스트리트저널',
-        date: moment().format('YYYY-MM-DD HH:mm'),
-        content: `오늘의 뉴욕 증시 마감 동향입니다. ${moment().format('YYYY년 MM월 DD일')}의 주요 지수와 종목별 분석을 확인하세요.`,
-        imageUrl: 'https://images.unsplash.com/photo-1611974789855-9c2a0a7236a3?q=80&w=2070'
-      },
-    ];
-    
-    newsData['미국주식'] = [...newNews, ...newsData['미국주식']].slice(0, 9);
-    console.log(`미국주식 뉴스 ${newNews.length}개 수집 완료`);
-    
-  } catch (error) {
-    console.error('미국주식 뉴스 수집 중 오류 발생:', error);
-  }
-};
-
-const collectExchangeRateNews = async () => {
-  try {
-    console.log('환율 뉴스 수집 중...');
-    
-    // 네이버 금융 환율 정보 페이지에서 직접 스크래핑
-    const response = await axios.get('https://finance.naver.com/marketindex/?tabSel=exchange', {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-      }
-    });
-    
-    const $ = cheerio.load(response.data);
-    const exchangeArticles = [];
-    
-    // 주요 환율 정보 추출
-    $('.data_lst li').each((index, element) => {
-      if (exchangeArticles.length < 9) {
-        const currencyName = $(element).find('.h_lst').text().trim();
-        const value = $(element).find('.value').text().trim();
-        const change = $(element).find('.change').text().trim();
-        const status = $(element).find('.blind').text().trim();
-        const tabCd = $(element).attr('data-tab-cd') || '';
-        
-        if (currencyName && value) {
-          const detailUrl = `https://finance.naver.com/marketindex/exchangeDetail.naver?marketindexCd=${tabCd}`;
-          const title = `${currencyName} 환율: ${value}원`;
-          const content = `현재 ${currencyName} 환율은 ${value}원이며, 전일 대비 ${change} ${status}했습니다. 이는 실시간으로 변동되는 시세입니다.`;
-          
-          exchangeArticles.push({
-            title,
-            source: '네이버 금융',
-            date: moment().format('YYYY-MM-DD HH:mm'),
-            content,
-            link: detailUrl,
-            imageUrl: currencyImages[index % currencyImages.length]
-          });
-        }
-      }
-    });
-    
-    // 환율 뉴스 가져오기
-    if (exchangeArticles.length < 9) {
-      try {
-        // 뉴스 스크래핑 시도 - 이데일리 환율뉴스
-        const newsResponse = await axios.get('https://www.edaily.co.kr/search/news/?keyword=%ED%99%98%EC%9C%A8&page=1', {
-          headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-          }
-        });
-        
-        const news$ = cheerio.load(newsResponse.data);
-        
-        news$('.list-news li').each((index, element) => {
-          if (exchangeArticles.length < 9) {
-            const titleEl = news$(element).find('.tit');
-            const title = titleEl.text().trim();
-            let link = news$(element).find('a').attr('href');
-            
-            if (link && !link.startsWith('http')) {
-              link = 'https://www.edaily.co.kr' + link;
-            }
-            
-            const date = news$(element).find('.date').text().trim() || moment().format('YYYY-MM-DD HH:mm');
-            
-            if (title && link) {
-              exchangeArticles.push({
-                title,
-                source: '이데일리',
-                date,
-                content: `${title} - 자세한 내용은 원문을 참조하세요.`,
-                link,
-                imageUrl: news$(element).find('img').attr('src') || currencyImages[(exchangeArticles.length) % currencyImages.length]
-              });
-            }
-          }
-        });
-      } catch (newsError) {
-        console.error('환율 뉴스 스크래핑 중 오류 발생:', newsError.message);
-      }
-    }
-    
-    // 네이버 뉴스에서도 환율 관련 뉴스 가져오기
-    if (exchangeArticles.length < 9) {
-      try {
-        const naverNewsResponse = await axios.get('https://search.naver.com/search.naver?where=news&query=%ED%99%98%EC%9C%A8&sm=tab_opt&sort=1', {
-          headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-          }
-        });
-        
-        const naverNews$ = cheerio.load(naverNewsResponse.data);
-        
-        naverNews$('.news_area').each((index, element) => {
-          if (exchangeArticles.length < 9) {
-            const titleEl = naverNews$(element).find('.news_tit');
-            const title = titleEl.text().trim();
-            const link = titleEl.attr('href');
-            const source = naverNews$(element).find('.info_group a.info').first().text().trim();
-            const date = naverNews$(element).find('.info_group span.info').text().trim() || moment().format('YYYY-MM-DD HH:mm');
-            
-            if (title && link) {
-              exchangeArticles.push({
-                title,
-                source: source || '네이버 뉴스',
-                date,
-                content: `${title} - 자세한 내용은 원문을 참조하세요.`,
-                link,
-                imageUrl: currencyImages[(exchangeArticles.length) % currencyImages.length]
-              });
-            }
-          }
-        });
-      } catch (naverNewsError) {
-        console.error('네이버 환율 뉴스 스크래핑 중 오류 발생:', naverNewsError.message);
-      }
-    }
-    
-    // 가져온 뉴스가 있으면 사용, 없으면 기본 데이터 사용
-    if (exchangeArticles.length > 0) {
-      newsData['환율'] = exchangeArticles;
-      console.log(`환율 뉴스 ${exchangeArticles.length}개 수집 완료 (실제 데이터)`);
-    } else {
-      // 기본 데이터
-      const fallbackData = [{
-        title: `오늘의 환율 정보: 원/달러 약 1350원대 거래`,
-        source: '외환시장',
-        date: moment().format('YYYY-MM-DD HH:mm'),
-        content: `현재 원/달러 환율은 약 1350원 수준에서 거래되고 있습니다. 이는 전일 대비 소폭 상승한 수치입니다. 글로벌 경제 불안과 미 달러화 강세가 원화 가치에 영향을 주고 있는 것으로 분석됩니다.`,
-        imageUrl: 'https://images.unsplash.com/photo-1600679362237-e168aa39b362?q=80&w=2070',
-        link: 'https://finance.naver.com/marketindex/?tabSel=exchange'
-      }];
-      
-      newsData['환율'] = fallbackData;
-      console.log(`환율 뉴스 ${fallbackData.length}개 수집 완료 (기본 데이터)`);
-    }
-    
-  } catch (error) {
-    console.error('환율 뉴스 수집 중 오류 발생:', error.message);
-    
-    // 오류 발생 시 기본 데이터 사용
-    const fallbackData = [{
-      title: `오늘의 환율 정보: 원/달러 약 1350원대 거래`,
-      source: '외환시장',
-      date: moment().format('YYYY-MM-DD HH:mm'),
-      content: `현재 원/달러 환율은 약 1350원 수준에서 거래되고 있습니다. 이는 전일 대비 소폭 상승한 수치입니다. 글로벌 경제 불안과 미 달러화 강세가 원화 가치에 영향을 주고 있는 것으로 분석됩니다.`,
-      imageUrl: 'https://images.unsplash.com/photo-1600679362237-e168aa39b362?q=80&w=2070',
-      link: 'https://finance.naver.com/marketindex/?tabSel=exchange'
-    }];
-    
-    newsData['환율'] = fallbackData;
-    console.log(`환율 뉴스 ${fallbackData.length}개 수집 완료 (오류 대체 데이터)`);
-  }
-};
-
-// 모든 뉴스 수집 함수
-const collectAllNews = async () => {
-  console.log(`[${moment().format('YYYY-MM-DD HH:mm:ss')}] 뉴스 수집 작업 시작...`);
   
-  await Promise.all([
-    collectEconomicNews(),
-    collectSportsNews(),
-    collectUSStockNews(),
-    collectExchangeRateNews()
-  ]);
+  const endTime = Date.now();
+  const duration = ((endTime - startTime) / 1000).toFixed(2);
   
   lastUpdateTime = moment().format('YYYY년 MM월 DD일 HH:mm:ss');
-  console.log(`[${moment().format('YYYY-MM-DD HH:mm:ss')}] 뉴스 수집 작업 완료`);
+  console.log(`\n⏱️ 소요시간: ${duration}초`);
+  
+  if (duration > expectedDuration) {
+    console.log(`\n⚠️ 경고: 예상 시간(${expectedDuration}초)보다 ${(duration - expectedDuration).toFixed(2)}초 더 걸렸습니다.`);
+  }
+  
+  console.log(`\n🎉 [${moment().format('YYYY-MM-DD HH:mm:ss')}] 뉴스 수집 완료!`);
+  console.log(`📊 총 ${Object.values(newsData).flat().length}개의 뉴스 수집됨\n`);
 };
 
-// 초기 데이터 로드 - 서버 시작 시 실행
+// 초기 데이터 설정
 const initializeData = async () => {
-  // 실제 사진으로 이미지 URL 목록 변경
-  const economicImages = [
+  console.log('🎬 초기 데이터 설정 중...');
+  
+  const defaultImages = {
+    경제: [
     'https://images.unsplash.com/photo-1590283603385-17ffb3a7f29f?q=80&w=2070',
     'https://images.unsplash.com/photo-1444653614773-995cb1ef9efa?q=80&w=2076',
     'https://images.unsplash.com/photo-1638913662415-8c5f79b20656?q=80&w=2070',
     'https://images.unsplash.com/photo-1604594849809-dfedbc827105?q=80&w=2070',
-    'https://images.unsplash.com/photo-1526304640581-d334cdbbf45e?q=80&w=2070',
-    'https://images.unsplash.com/photo-1535320903710-d993d3d77d29?q=80&w=2070',
-    'https://images.unsplash.com/photo-1633158829585-23ba8f7c8caf?q=80&w=2070',
-    'https://images.unsplash.com/photo-1454165804606-c3d57bc86b40?q=80&w=2070',
-    'https://images.unsplash.com/photo-1579621970563-ebec7560ff3e?q=80&w=2071'
-  ];
-  
-  const sportsImages = [
+      'https://images.unsplash.com/photo-1526304640581-d334cdbbf45e?q=80&w=2070'
+    ],
+    스포츠: [
     'https://images.unsplash.com/photo-1461896836934-ffe607ba8211?q=80&w=2070',
     'https://images.unsplash.com/photo-1541534741688-6078c6bfb5c5?q=80&w=2069',
     'https://images.unsplash.com/photo-1579952363873-27f3bade9f55?q=80&w=2070',
     'https://images.unsplash.com/photo-1517649763962-0c623066013b?q=80&w=2070',
-    'https://images.unsplash.com/photo-1530549387789-4c1017266635?q=80&w=2070',
-    'https://images.unsplash.com/photo-1574629810360-7efbbe195018?q=80&w=2076',
-    'https://images.unsplash.com/photo-1530549387789-4c1017266635?q=80&w=2070',
-    'https://images.unsplash.com/photo-1628891890467-b79f2c8ba9dc?q=80&w=2070',
-    'https://images.unsplash.com/photo-1560089000-7433a4ebbd64?q=80&w=2070'
-  ];
-  
-  const stockImages = [
-    'https://images.unsplash.com/photo-1611974789855-9c2a0a7236a3?q=80&w=2070',
-    'https://images.unsplash.com/photo-1535320903710-d993d3d77d29?q=80&w=2070',
+      'https://images.unsplash.com/photo-1530549387789-4c1017266635?q=80&w=2070'
+    ],
+    미국주식: [
     'https://images.unsplash.com/photo-1611974789855-9c2a0a7236a3?q=80&w=2070',
     'https://images.unsplash.com/photo-1535320903710-d993d3d77d29?q=80&w=2070',
     'https://images.unsplash.com/photo-1560221328-12fe60f83ab8?q=80&w=2074',
     'https://images.unsplash.com/photo-1590283603385-17ffb3a7f29f?q=80&w=2070',
-    'https://images.unsplash.com/photo-1611974789855-9c2a0a7236a3?q=80&w=2070',
-    'https://images.unsplash.com/photo-1449157291145-7efd050a4d0e?q=80&w=2070',
-    'https://images.unsplash.com/photo-1569025690938-a00729c9e1f9?q=80&w=2070'
-  ];
-  
-  const currencyImages = [
+      'https://images.unsplash.com/photo-1449157291145-7efd050a4d0e?q=80&w=2070'
+    ],
+    환율: [
     'https://images.unsplash.com/photo-1600679362237-e168aa39b362?q=80&w=2070',
     'https://images.unsplash.com/photo-1544375555-c5cabcd5b6ef?q=80&w=2070',
     'https://images.unsplash.com/photo-1580519542036-c47de6196ba5?q=80&w=2071',
     'https://images.unsplash.com/photo-1591832608633-c212b667b4da?q=80&w=2070',
-    'https://images.unsplash.com/photo-1534951009808-766178b47a4f?q=80&w=2070',
-    'https://images.unsplash.com/photo-1601389848186-9ed2af7e8488?q=80&w=2052',
-    'https://images.unsplash.com/photo-1553729459-efe14ef6055d?q=80&w=2070',
-    'https://images.unsplash.com/photo-1618044733300-9472054094ee?q=80&w=2071',
-    'https://images.unsplash.com/photo-1618044619888-009e412ff12a?q=80&w=2070'
-  ];
+      'https://images.unsplash.com/photo-1534951009808-766178b47a4f?q=80&w=2070'
+    ]
+  };
   
-  // 실제 뉴스 데이터를 가져오기 위한 사이트 URL 설정
-  const newsSources = {
-    economy: {
-      site: 'https://www.hankyung.com/economy',
-      selector: '.news-list .news-item',
-      titleSelector: '.news-tit',
-      timeSelector: '.date-time',
-      domain: 'https://www.hankyung.com'
-    },
-    sports: {
-      site: 'https://sports.news.naver.com/',
-      selector: '.home_news .content',
-      titleSelector: '.title',
-      timeSelector: '.info',
-      domain: 'https://sports.news.naver.com'
-    },
-    stock: {
-      site: 'https://finance.naver.com/news/mainnews.naver',
-      selector: '.mainNewsList li',
-      titleSelector: 'dd.articleSubject a',
-      timeSelector: 'dd.articleSummary',
-      domain: 'https://finance.naver.com'
-    },
-    exchange: {
-      site: 'https://finance.naver.com/marketindex/?tabSel=exchange',
-      selector: '.data_lst li',
-      valueSelector: '.value',
-      changeSelector: '.change',
-      domain: 'https://finance.naver.com'
-    }
-  };
-
-  // 뉴스 스크래핑 함수
-  const scrapeNews = async (sourceType) => {
-    try {
-      const source = newsSources[sourceType];
-      const response = await axios.get(source.site, {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-        }
-      });
-      
-      const $ = cheerio.load(response.data);
-      const items = [];
-      
-      $(source.selector).each((index, element) => {
-        if (index < 9) {
-          let title, link, time, content;
-          
-          if (sourceType === 'exchange') {
-            const currencyName = $(element).find('.h_lst').text().trim();
-            const value = $(element).find(source.valueSelector).text().trim();
-            const change = $(element).find(source.changeSelector).text().trim();
-            
-            title = `${currencyName} 환율: ${value}원`;
-            link = `${source.domain}/marketindex/exchangeDetail.naver?marketindexCd=${$(element).attr('data-tab-cd') || ''}`;
-            time = moment().format('YYYY-MM-DD HH:mm');
-            content = `현재 ${currencyName} 환율은 ${value}원이며, 전일 대비 ${change}입니다. 이는 실시간으로 변동되는 시세입니다.`;
-          } else {
-            title = $(element).find(source.titleSelector).text().trim();
-            link = $(element).find('a').attr('href');
-            
-            if (link && !link.startsWith('http')) {
-              link = link.startsWith('/') ? source.domain + link : source.domain + '/' + link;
-            }
-            
-            time = $(element).find(source.timeSelector).text().trim() || moment().format('YYYY-MM-DD HH:mm');
-            content = `${title} - 자세한 내용은 원문을 참조하세요.`;
-          }
-          
-          // 각 카테고리별 기본 이미지 설정
-          let imageUrl;
-          switch(sourceType) {
-            case 'economy':
-              imageUrl = economicImages[index % economicImages.length];
-              break;
-            case 'sports':
-              imageUrl = sportsImages[index % sportsImages.length];
-              break;
-            case 'stock':
-              imageUrl = stockImages[index % stockImages.length];
-              break;
-            case 'exchange':
-              imageUrl = currencyImages[index % currencyImages.length];
-              break;
-          }
-          
-          items.push({
-            title,
-            source: sourceType === 'economy' ? '한국경제' :
-                    sourceType === 'sports' ? '스포츠 뉴스' :
-                    sourceType === 'stock' ? '네이버 금융' : '네이버 환율정보',
-            date: time,
-            content,
-            link,
-            imageUrl
-          });
-        }
-      });
-      
-      return items;
-    } catch (error) {
-      console.error(`${sourceType} 뉴스 스크래핑 중 오류 발생:`, error.message);
-      return [];
-    }
-  };
-
-  try {
-    // 실시간 스크래핑 시도
-    const economyNews = await scrapeNews('economy');
-    const sportsNews = await scrapeNews('sports');
-    const stockNews = await scrapeNews('stock');
-    const exchangeNews = await scrapeNews('exchange');
-    
-    // 실제 뉴스 데이터가 있으면 사용하고, 없으면 기존 더미 데이터 사용
-    newsData = {
-      '경제': economyNews.length > 0 ? economyNews : Array.from({ length: 9 }, (_, i) => ({
-        title: `한국 경제 뉴스 ${i+1}`,
-        source: '경제신문',
-        date: moment().subtract(i, 'hours').format('YYYY-MM-DD HH:mm'),
-        content: `이것은 한국 경제에 관한 뉴스 ${i+1}의 내용입니다. 이 데이터는 서버 시작 시 생성된 초기 데이터입니다.`,
-        imageUrl: economicImages[i],
-        link: 'https://www.hankyung.com/economy'
-      })),
-      '스포츠': sportsNews.length > 0 ? sportsNews : Array.from({ length: 9 }, (_, i) => ({
-        title: `스포츠 뉴스 ${i+1}`,
-        source: '스포츠신문',
-        date: moment().subtract(i, 'hours').format('YYYY-MM-DD HH:mm'),
-        content: `이것은 스포츠에 관한 뉴스 ${i+1}의 내용입니다. 이 데이터는 서버 시작 시 생성된 초기 데이터입니다.`,
-        imageUrl: sportsImages[i],
-        link: 'https://sports.news.naver.com/'
-      })),
-      '미국주식': stockNews.length > 0 ? stockNews : Array.from({ length: 9 }, (_, i) => ({
-        title: `미국 주식 뉴스 ${i+1}`,
-        source: '월스트리트저널',
-        date: moment().subtract(i, 'hours').format('YYYY-MM-DD HH:mm'),
-        content: `이것은 미국 주식에 관한 뉴스 ${i+1}의 내용입니다. 이 데이터는 서버 시작 시 생성된 초기 데이터입니다.`,
-        imageUrl: stockImages[i],
-        link: 'https://finance.naver.com/news/mainnews.naver'
-      })),
-      '환율': exchangeNews.length > 0 ? exchangeNews : Array.from({ length: 9 }, (_, i) => ({
-        title: `환율 뉴스 ${i+1}`,
-        source: '외환시장',
-        date: moment().subtract(i, 'hours').format('YYYY-MM-DD HH:mm'),
-        content: `이것은 환율에 관한 뉴스 ${i+1}의 내용입니다. 이 데이터는 서버 시작 시 생성된 초기 데이터입니다.`,
-        imageUrl: currencyImages[i],
-        link: 'https://finance.naver.com/marketindex/?tabSel=exchange'
-      }))
-    };
-    
-    console.log('초기 데이터 생성 완료');
-  } catch (error) {
-    console.error('초기 데이터 생성 중 오류:', error.message);
-    
-    // 오류 발생 시 기본 데이터 사용
-    newsData = {
-      '경제': Array.from({ length: 9 }, (_, i) => ({
-        title: `한국 경제 뉴스 ${i+1}`,
-        source: '경제신문',
-        date: moment().subtract(i, 'hours').format('YYYY-MM-DD HH:mm'),
-        content: `이것은 한국 경제에 관한 뉴스 ${i+1}의 내용입니다. 이 데이터는 서버 시작 시 생성된 초기 데이터입니다.`,
-        imageUrl: economicImages[i],
-        link: 'https://www.hankyung.com/economy'
-      })),
-      '스포츠': Array.from({ length: 9 }, (_, i) => ({
-        title: `스포츠 뉴스 ${i+1}`,
-        source: '스포츠신문',
-        date: moment().subtract(i, 'hours').format('YYYY-MM-DD HH:mm'),
-        content: `이것은 스포츠에 관한 뉴스 ${i+1}의 내용입니다. 이 데이터는 서버 시작 시 생성된 초기 데이터입니다.`,
-        imageUrl: sportsImages[i],
-        link: 'https://sports.news.naver.com/'
-      })),
-      '미국주식': Array.from({ length: 9 }, (_, i) => ({
-        title: `미국 주식 뉴스 ${i+1}`,
-        source: '월스트리트저널',
-        date: moment().subtract(i, 'hours').format('YYYY-MM-DD HH:mm'),
-        content: `이것은 미국 주식에 관한 뉴스 ${i+1}의 내용입니다. 이 데이터는 서버 시작 시 생성된 초기 데이터입니다.`,
-        imageUrl: stockImages[i],
-        link: 'https://finance.naver.com/news/mainnews.naver'
-      })),
-      '환율': Array.from({ length: 9 }, (_, i) => ({
-        title: `환율 뉴스 ${i+1}`,
-        source: '외환시장',
-        date: moment().subtract(i, 'hours').format('YYYY-MM-DD HH:mm'),
-        content: `이것은 환율에 관한 뉴스 ${i+1}의 내용입니다. 이 데이터는 서버 시작 시 생성된 초기 데이터입니다.`,
-        imageUrl: currencyImages[i],
-        link: 'https://finance.naver.com/marketindex/?tabSel=exchange'
-      }))
-    };
-  }
+  // 초기 더미 데이터 (실제 YouTube 데이터로 곧 교체됨)
+  Object.keys(defaultImages).forEach(category => {
+    newsData[category] = Array.from({ length: 5 }, (_, i) => ({
+      id: `init_${category}_${i}`,
+      title: `${category} 뉴스 ${i+1} (초기 데이터)`,
+      source: '초기화',
+      date: moment().subtract(i, 'hours').format('YYYY-MM-DD HH:mm'),
+      content: `이것은 ${category}에 관한 초기 데이터입니다. 곧 실제 YouTube 뉴스로 교체됩니다.`,
+      imageUrl: defaultImages[category][i],
+      link: '#'
+    }));
+  });
+  
+  console.log('✅ 초기 데이터 설정 완료');
 };
 
-// 스케줄러 설정 - 매 시간 0분에 실행 (시간당 한 번)
-cron.schedule('0 * * * *', collectAllNews);
-
-// 데모용 - 매 분마다 실행 (테스트용)
-// cron.schedule('* * * * *', collectAllNews);
-
-// 서버 시작
-app.listen(PORT, () => {
-  console.log(`서버가 포트 ${PORT}에서 실행 중입니다`);
-  console.log(`현재 시간: ${moment().format('YYYY년 MM월 DD일 HH:mm:ss')} (KST)`);
+// API 엔드포인트들
+app.get('/api/news/:category', (req, res) => {
+  const { category } = req.params;
+  const categoryMap = {
+    'economy': '경제',
+    'sports': '스포츠', 
+    'us-stocks': '미국주식',
+    'exchange-rate': '환율'
+  };
   
-  // 초기 데이터 생성
-  initializeData().then(() => {
-    console.log('초기 데이터 생성 완료');
-    // 뉴스 수집 시작
-    collectAllNews();
-    
-    // 1시간마다 뉴스 자동 수집 (cron 표현식: 매 시간 0분에 실행)
-    cron.schedule('0 * * * *', () => {
-      collectAllNews();
-    });
+  const koreanCategory = categoryMap[category];
+  if (!koreanCategory || !newsData[koreanCategory]) {
+    return res.status(404).json({ error: '카테고리를 찾을 수 없습니다' });
+  }
+  
+  res.json({
+    news: newsData[koreanCategory],
+    lastUpdate: lastUpdateTime,
+    category: koreanCategory
   });
 });
 
-// SPA 지원을 위한 라우트 - 모든 경로에서 index.html 반환
-// 실제 배포 시 사용할 코드
-// app.get('*', (req, res) => {
-//   res.sendFile(path.join(__dirname, '../frontend/build/index.html'));
-// }); 
+app.get('/api/news', (req, res) => {
+  res.json({
+    news: newsData,
+    lastUpdate: lastUpdateTime,
+    categories: Object.keys(newsData)
+  });
+});
+
+app.get('/api/status', (req, res) => {
+  res.json({
+    status: 'running',
+    lastUpdate: lastUpdateTime,
+    categories: Object.keys(newsData),
+    totalArticles: Object.values(newsData).flat().length,
+    server: 'YouTube RSS Only System',
+    version: '2.0'
+  });
+});
+
+// 수동 뉴스 수집 엔드포인트
+app.post('/api/collect-news', async (req, res) => {
+  try {
+    await collectAllNews();
+    res.json({ 
+      success: true, 
+      message: '뉴스 수집이 완료되었습니다',
+      lastUpdate: lastUpdateTime 
+    });
+  } catch (error) {
+    res.status(500).json({ 
+      success: false, 
+      error: error.message 
+    });
+  }
+});
+
+// 🚀 서버 시작
+app.listen(PORT, async () => {
+  console.log(`🚀 서버가 포트 ${PORT}에서 시작되었습니다!`);
+  
+  // 초기 데이터 설정
+  await initializeData();
+  
+  // 첫 뉴스 수집 실행
+  await collectAllNews();
+  
+  // 10분마다 뉴스 수집 (cron)
+  cron.schedule('*/10 * * * *', async () => {
+    await collectAllNews();
+  });
+});
